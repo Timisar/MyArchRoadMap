@@ -86,7 +86,7 @@ paru -S umu-launcher
 
 ##Example
 ```fish
-winpkg snapshots app ofice365          
+winpkg snapshots app office365          
 winpkg restore app office365 pre-install-20260711123456
 ```
 
