@@ -41,7 +41,7 @@ Then restart your terminal or `source ~/.config/fish/config.fish`.
 winpkg always lives in `~/.local/share/winpkg` — it doesn't matter what directory you're in when you run these commands.
 
 ```fish
-winpkg init          # once, ever
+winpkg init         
 ```
 
 Build (install + set up a launcher) for an app:
@@ -84,8 +84,9 @@ paru -S umu-launcher
 
 **An install/update broke something** — every `deps`/`install` auto-snapshots first, so roll back:
 
+##Example
 ```fish
-winpkg snapshots app office365          # list available snapshots
+winpkg snapshots app ofice365          
 winpkg restore app office365 pre-install-20260711123456
 ```
 
