@@ -1,0 +1,976 @@
+#!/usr/bin/env bash
+# winpkg v9 - Wine app/game manager (Arch/CachyOS)
+#
+# Quick path (this is the one you actually need day to day):
+#   winpkg init                                     (once, ever)
+#   winpkg build app office365 ~/Downloads/setup.exe vcrun2022 dotnet48 msxml6
+#   winpkg status
+#
+# Everything below "build" (create/deps/install/scan/menu/run/...) still
+# exists for fine-grained control, but build wraps all of it into one call.
+#
+# ~/.local/share/winpkg/
+#   template/prefix/            minimal shared base (fonts, wine defaults) - reflinked per app
+#   apps/<name>/{prefix, config.json, snapshots/<label>/{prefix, meta.json}}
+#   games/<name>/{prefix, config.json, snapshots/<label>/{prefix, meta.json}}
+#   runtime/winetricks-cache/   shared download cache for winetricks (files only, not state)
+#   installers/                 downloaded app/game installers
+#   logs/                       per-run stdout/stderr logs
+#   trash/                      soft-deleted apps/games (winpkg remove moves here)
+
+set -euo pipefail
+
+MANAGER_VERSION="9.0"
+WINPKG_HOME="${WINPKG_HOME:-$HOME/.local/share/winpkg}"
+TEMPLATE="$WINPKG_HOME/template/prefix"
+INSTALLERS="$WINPKG_HOME/installers"
+RUNTIME_CACHE="$WINPKG_HOME/runtime/winetricks-cache"
+LOGS="$WINPKG_HOME/logs"
+TRASH="$WINPKG_HOME/trash"
+APPDIR_DESKTOP="$HOME/.local/share/applications"
+SELF="$(readlink -f "$0")"
+
+die() { echo "winpkg: $*" >&2; exit 1; }
+
+command -v flock >/dev/null || die "flock not found (pacman -S util-linux)"
+
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid name: '$1' (letters, digits, . _ - only)"
+}
+
+assert_safe_path() {
+  local target="$1"
+  [ -n "$target" ] || die "refusing rm: empty path"
+  local resolved home
+  resolved="$(readlink -f "$target" 2>/dev/null || true)"
+  home="$(readlink -f "$WINPKG_HOME" 2>/dev/null || true)"
+  [ -n "$resolved" ] && [ -n "$home" ] || die "refusing rm: could not resolve path"
+  [ "$resolved" != "$home" ] || die "refusing rm: path is winpkg home itself ($home)"
+  case "$resolved" in
+    "$home"/*) ;;
+    *) die "refusing rm: '$resolved' is outside winpkg home ($home)" ;;
+  esac
+}
+
+kind_dir() {
+  case "$1" in
+    app)  echo "$WINPKG_HOME/apps" ;;
+    game) echo "$WINPKG_HOME/games" ;;
+    *) die "unknown kind '$1' (use app|game)" ;;
+  esac
+}
+
+appdir_of() { valid_name "$2"; echo "$(kind_dir "$1")/$2"; }
+
+reflink_copy_contents() {
+  local src="$1" dst="$2"
+  shopt -s dotglob nullglob
+  local files=("$src"/*)
+  shopt -u dotglob nullglob
+  [ ${#files[@]} -gt 0 ] || die "source is empty: $src"
+  if cp --reflink=always -r "${files[@]}" "$dst/" 2>/dev/null; then
+    echo "  reflink copy (near-zero cost)"
+  else
+    echo "  reflink unsupported here, full copy..."
+    cp -r "${files[@]}" "$dst/"
+  fi
+}
+
+json_init() {
+  local cfg="$1" kind="$2" name="$3"
+  local default_runner="wine"; [ "$kind" = "game" ] && default_runner="umu-run"
+  local wine_version="unknown"
+  if [ "$kind" = "app" ] && command -v wine >/dev/null; then
+    wine_version="$(wine --version 2>/dev/null || echo unknown)"
+  fi
+  python3 - "$cfg" "$kind" "$name" "$default_runner" "$wine_version" "$MANAGER_VERSION" <<'EOF'
+import json, sys, datetime
+cfg, kind, name, runner, wine_version, mgr = sys.argv[1:7]
+data = {
+    "schema": 2,
+    "manager_version": mgr,
+    "name": name, "kind": kind,
+    "created": datetime.datetime.now().isoformat(timespec="seconds"),
+    "wine_arch": "win64",
+    "wine_version": wine_version,
+    "deps": [], "exe": None, "display_name": name, "icon": None,
+    "installer": None, "runner": runner, "env": {},
+}
+json.dump(data, open(cfg, "w"), indent=2)
+EOF
+}
+
+json_add_deps() {
+  local cfg="$1"; shift
+  python3 - "$cfg" "$@" <<'EOF'
+import json, sys
+cfg = sys.argv[1]
+verbs = sys.argv[2:]
+data = json.load(open(cfg))
+for v in verbs:
+    if v not in data["deps"]:
+        data["deps"].append(v)
+json.dump(data, open(cfg, "w"), indent=2)
+EOF
+}
+
+json_set() {
+  local cfg="$1" key="$2" val="$3"
+  python3 - "$cfg" "$key" "$val" <<'EOF'
+import json, sys
+cfg, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(cfg))
+try:
+    typed = json.loads(val)
+except (json.JSONDecodeError, ValueError):
+    typed = val
+data[key] = typed
+json.dump(data, open(cfg, "w"), indent=2)
+EOF
+}
+
+json_set_string() {
+  local cfg="$1" key="$2" val="$3"
+  python3 - "$cfg" "$key" "$val" <<'EOF'
+import json, sys
+cfg, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(cfg))
+data[key] = val
+json.dump(data, open(cfg, "w"), indent=2)
+EOF
+}
+
+json_set_env() {
+  local cfg="$1" key="$2" val="$3"
+  python3 - "$cfg" "$key" "$val" <<'EOF'
+import json, sys
+cfg, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(cfg))
+data.setdefault("env", {})[key] = val
+json.dump(data, open(cfg, "w"), indent=2)
+EOF
+}
+
+json_get() {
+  local cfg="$1" key="$2"
+  python3 - "$cfg" "$key" <<'EOF'
+import json, sys
+data = json.load(open(sys.argv[1]))
+v = data.get(sys.argv[2])
+print(v if v is not None else "")
+EOF
+}
+
+json_has_dep() {
+  local cfg="$1" verb="$2"
+  python3 - "$cfg" "$verb" <<'EOF'
+import json, sys
+data = json.load(open(sys.argv[1]))
+sys.exit(0 if sys.argv[2] in data["deps"] else 1)
+EOF
+}
+
+json_get_env_pairs() {
+  local cfg="$1"
+  python3 - "$cfg" <<'EOF'
+import json, sys
+data = json.load(open(sys.argv[1]))
+for k, v in data.get("env", {}).items():
+    sys.stdout.write(k + "\0" + str(v) + "\0")
+EOF
+}
+
+with_prefix_lock() {
+  local prefix="$1"; shift
+  local lockfile="$prefix/.lock"
+  mkdir -p "$prefix"
+  (
+    flock -n 9 || die "prefix already in use by another winpkg process: $prefix"
+    "$@"
+  ) 9>"$lockfile"
+}
+
+with_prefix_lock_logged() {
+  local prefix="$1" logfile="$2"; shift 2
+  with_prefix_lock "$prefix" bash -c '
+    logfile="$1"; shift
+    "$@" 2>&1 | tee "$logfile"
+  ' bash "$logfile" "$@"
+}
+
+build_env_args() {
+  local cfg="$1"
+  local -n out_arr="$2"
+  out_arr=()
+  local key val
+  while IFS= read -r -d '' key && IFS= read -r -d '' val; do
+    out_arr+=("$key=$val")
+  done < <(json_get_env_pairs "$cfg")
+}
+
+safe_installer_name() {
+  local src="$1"
+  local stripped="${src%%\?*}"
+  local base; base="$(basename "$stripped")"
+  base="$(echo "$base" | tr -cd 'A-Za-z0-9._-')"
+  if [ -z "$base" ] || [[ "$base" != *.* ]]; then
+    base="$(date +%s)-installer.exe"
+  fi
+  echo "$base"
+}
+
+desktop_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
+
+cmd_init() {
+  mkdir -p "$WINPKG_HOME"/{apps,games,installers,logs,trash} "$WINPKG_HOME/template" "$RUNTIME_CACHE"
+  if [ ! -d "$TEMPLATE" ]; then
+    echo "Creating minimal template prefix at $TEMPLATE ..."
+    WINEPREFIX="$TEMPLATE" WINEARCH=win64 wineboot --init
+    WINETRICKS_CACHE="$RUNTIME_CACHE" WINEPREFIX="$TEMPLATE" winetricks -q corefonts
+    echo "Template ready (fonts + wine defaults only, on purpose)."
+  else
+    echo "Template already exists at $TEMPLATE"
+  fi
+}
+
+cmd_create() {
+  local kind="$1" name="$2"; valid_name "$name"
+  [ -d "$TEMPLATE" ] || die "no template yet, run: winpkg init"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -e "$appdir" ] && die "'$name' already exists under $kind"
+  mkdir -p "$appdir/prefix" "$appdir/snapshots"
+  echo "Creating prefix for $name ($kind)..."
+  reflink_copy_contents "$TEMPLATE" "$appdir/prefix"
+  json_init "$appdir/config.json" "$kind" "$name"
+  echo "Created. Next: winpkg deps $kind $name <winetricks-verbs...>"
+}
+
+cmd_clone() {
+  local kind="$1" src="$2" dst="$3"; valid_name "$src"; valid_name "$dst"
+  local srcdir; srcdir="$(appdir_of "$kind" "$src")"
+  local dstdir; dstdir="$(appdir_of "$kind" "$dst")"
+  [ -d "$srcdir/prefix" ] || die "no such $kind: $src"
+  [ -e "$dstdir" ] && die "'$dst' already exists under $kind"
+  mkdir -p "$dstdir/prefix" "$dstdir/snapshots"
+  echo "Cloning $src -> $dst ..."
+  reflink_copy_contents "$srcdir/prefix" "$dstdir/prefix"
+  rm -f "$dstdir/prefix/.lock"
+  python3 - "$srcdir/config.json" "$dstdir/config.json" "$dst" <<'EOF'
+import json, sys, datetime
+src, dst, name = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(src))
+data["name"] = name
+data["display_name"] = name
+data["created"] = datetime.datetime.now().isoformat(timespec="seconds")
+json.dump(data, open(dst, "w"), indent=2)
+EOF
+  echo "Cloned. New entry: $kind $dst"
+}
+
+cmd_snapshot() {
+  local kind="$1" name="$2" label="$3"; valid_name "$name"; valid_name "$label"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir/prefix" ] || die "no such $kind: $name"
+  local snapdir="$appdir/snapshots/$label"
+  [ -e "$snapdir" ] && die "snapshot '$label' already exists for $name"
+
+  with_prefix_lock "$appdir/prefix" bash -c '
+    set -e
+    appdir="$1"; snapdir="$2"
+    mkdir -p "$snapdir/prefix"
+    shopt -s dotglob nullglob
+    files=("$appdir/prefix"/*)
+    shopt -u dotglob nullglob
+    [ ${#files[@]} -gt 0 ] || { echo "prefix is empty, nothing to snapshot" >&2; exit 1; }
+    if cp --reflink=always -r "${files[@]}" "$snapdir/prefix/" 2>/dev/null; then
+      :
+    else
+      cp -r "${files[@]}" "$snapdir/prefix/"
+    fi
+    rm -f "$snapdir/prefix/.lock"
+  ' bash "$appdir" "$snapdir" || {
+    assert_safe_path "$snapdir"
+    rm -rf "${snapdir:?}"
+    die "snapshot failed"
+  }
+
+  python3 - "$appdir/config.json" "$snapdir/meta.json" "$label" <<'EOF'
+import json, sys, datetime
+cfg, meta, label = sys.argv[1], sys.argv[2], sys.argv[3]
+config = json.load(open(cfg))
+snap = {
+    "label": label,
+    "snapshot_created": datetime.datetime.now().isoformat(timespec="seconds"),
+    "config": config,
+}
+json.dump(snap, open(meta, "w"), indent=2)
+EOF
+  echo "Snapshot '$label' created for $name."
+}
+
+cmd_restore() {
+  local kind="$1" name="$2" label="$3"; valid_name "$name"; valid_name "$label"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  assert_safe_path "$appdir"
+  local snapdir="$appdir/snapshots/$label"
+  [ -d "$snapdir/prefix" ] || die "no such snapshot: $label"
+
+  with_prefix_lock "$appdir/prefix" bash -c '
+    set -e
+    appdir="$1"; snapdir="$2"
+    WINEPREFIX="$appdir/prefix" wineserver -k 2>/dev/null || true
+    rm -rf "${appdir:?}/prefix.old"
+    mv "$appdir/prefix" "$appdir/prefix.old"
+    mkdir -p "$appdir/prefix"
+
+    shopt -s dotglob nullglob
+    files=("$snapdir/prefix"/*)
+    shopt -u dotglob nullglob
+    if [ ${#files[@]} -eq 0 ]; then
+      echo "snapshot prefix is empty, aborting" >&2
+      rm -rf "${appdir:?}/prefix"
+      mv "$appdir/prefix.old" "$appdir/prefix"
+      exit 1
+    fi
+
+    if cp --reflink=always -r "${files[@]}" "$appdir/prefix/" 2>/dev/null; then
+      :
+    elif cp -r "${files[@]}" "$appdir/prefix/" 2>/dev/null; then
+      :
+    else
+      echo "copy failed, rolling back to original prefix" >&2
+      rm -rf "${appdir:?}/prefix"
+      mv "$appdir/prefix.old" "$appdir/prefix"
+      exit 1
+    fi
+
+    rm -f "$appdir/prefix/.lock"
+    rm -rf "${appdir:?}/prefix.old"
+  ' bash "$appdir" "$snapdir" || die "restore failed, original prefix was recovered"
+
+  python3 - "$appdir/config.json" "$snapdir/meta.json" <<'EOF'
+import json, sys, datetime
+cfg, meta = sys.argv[1], sys.argv[2]
+snap = json.load(open(meta))
+restored = dict(snap["config"])
+restored["created"] = json.load(open(cfg)).get("created", restored.get("created"))
+restored["restored_from"] = snap["label"]
+restored["restored_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+json.dump(restored, open(cfg, "w"), indent=2)
+EOF
+  echo "Restored $name to snapshot '$label' (prefix + full config)."
+}
+
+cmd_snapshots() {
+  local kind="$1" name="$2"; valid_name "$name"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir/snapshots" ] || die "no such $kind: $name"
+  local any=0
+  for s in "$appdir/snapshots"/*/; do
+    [ -d "$s" ] || continue
+    any=1
+    local label; label="$(basename "$s")"
+    local created
+    created="$(python3 -c "import json;print(json.load(open('$s/meta.json'))['snapshot_created'])" 2>/dev/null || echo "?")"
+    echo "$label  ($created)"
+  done
+  [ "$any" -eq 1 ] || echo "(no snapshots)"
+}
+
+cmd_snapshot_remove() {
+  local kind="$1" name="$2" label="$3"; valid_name "$name"; valid_name "$label"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  local snapdir="$appdir/snapshots/$label"
+  [ -d "$snapdir" ] || die "no such snapshot: $label"
+  assert_safe_path "$snapdir"
+  rm -rf "${snapdir:?}"
+  echo "Removed snapshot '$label' from $name."
+}
+
+cmd_deps() {
+  local kind="$1" name="$2"; valid_name "$name"; shift 2
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir/prefix" ] || die "no such $kind: $name (run create first)"
+  [ $# -ge 1 ] || die "give one or more winetricks verbs, e.g. vcrun2022 dotnet48 msxml6"
+
+  local todo=()
+  for v in "$@"; do
+    if json_has_dep "$appdir/config.json" "$v"; then
+      echo "  $v already installed, skipping"
+    else
+      todo+=("$v")
+    fi
+  done
+  if [ ${#todo[@]} -eq 0 ]; then
+    echo "Nothing to do."
+    return 0
+  fi
+
+  local autolabel="pre-deps-$(date +%Y%m%d%H%M%S)-$$"
+  echo "Auto-snapshotting as '$autolabel' before installing deps..."
+  cmd_snapshot "$kind" "$name" "$autolabel"
+
+  mkdir -p "$RUNTIME_CACHE" "$LOGS"
+  local logfile="$LOGS/${kind}-${name}-deps-$(date +%Y%m%d-%H%M%S).log"
+  echo "Installing deps into $name: ${todo[*]}"
+  with_prefix_lock_logged "$appdir/prefix" "$logfile" \
+    env WINEPREFIX="$appdir/prefix" WINETRICKS_CACHE="$RUNTIME_CACHE" winetricks -q "${todo[@]}"
+  json_add_deps "$appdir/config.json" "${todo[@]}"
+  echo "Recorded in $appdir/config.json -> deps"
+}
+
+cmd_install() {
+  local kind="$1" name="$2" installer="$3"; valid_name "$name"; shift 3 || true
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir/prefix" ] || die "no such $kind: $name (run create first)"
+
+  local installer_path="$installer"
+  if [[ "$installer" == http://* || "$installer" == https://* ]]; then
+    mkdir -p "$INSTALLERS"
+    installer_path="$INSTALLERS/$(safe_installer_name "$installer")"
+    echo "Downloading $installer -> $installer_path ..."
+    curl -L -o "$installer_path" "$installer"
+  fi
+  [ -f "$installer_path" ] || die "installer not found: $installer_path"
+  installer_path="$(readlink -f "$installer_path")"
+
+  local autolabel="pre-install-$(date +%Y%m%d%H%M%S)-$$"
+  echo "Auto-snapshotting as '$autolabel' before running installer..."
+  cmd_snapshot "$kind" "$name" "$autolabel"
+
+  local runner; runner="$(json_get "$appdir/config.json" runner)"
+  command -v "$runner" >/dev/null || die "runner '$runner' not found on PATH"
+  local env_args=(); build_env_args "$appdir/config.json" env_args
+
+  mkdir -p "$LOGS"
+  local logfile="$LOGS/${kind}-${name}-install-$(date +%Y%m%d-%H%M%S).log"
+  echo "Running installer in $name's prefix (runner: $runner)... log: $logfile"
+  if [ "$kind" = "game" ]; then
+    with_prefix_lock_logged "$appdir/prefix" "$logfile" \
+      env WINEPREFIX="$appdir/prefix" GAMEID="$name" PROTONPATH="${PROTONPATH:-}" \
+        "${env_args[@]}" "$runner" "$installer_path" "$@"
+  else
+    with_prefix_lock_logged "$appdir/prefix" "$logfile" \
+      env WINEPREFIX="$appdir/prefix" "${env_args[@]}" "$runner" "$installer_path" "$@"
+  fi
+  json_set_string "$appdir/config.json" "installer" "$installer_path"
+  echo "(rollback if needed: winpkg restore $kind $name $autolabel)"
+}
+
+# --- scan: now supports a non-interactive mode (auto-picks when there's
+#     exactly one candidate) so `build` can run start-to-finish unattended
+#     whenever possible, and only prompts when it's genuinely ambiguous. ---
+cmd_scan() {
+  local kind="$1" name="$2"; valid_name "$name"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir/prefix" ] || die "no such $kind: $name"
+  local drive_c="$appdir/prefix/drive_c"
+
+  mapfile -t found < <(
+    find "$drive_c" -iname "*.exe" \
+      -not -ipath "*/windows/*" \
+      -not -iname "unins*.exe" \
+      -not -iname "vc_redist*.exe" \
+      2>/dev/null | sed "s|^$drive_c/||"
+  )
+  [ ${#found[@]} -gt 0 ] || die "no candidate .exe files found under drive_c"
+
+  local chosen
+  if [ ${#found[@]} -eq 1 ]; then
+    chosen="${found[0]}"
+    echo "Only one candidate exe found, using it: $chosen"
+  else
+    echo "Found:"
+    local i=1
+    for f in "${found[@]}"; do
+      echo "  $i) $f"
+      i=$((i+1))
+    done
+    read -rp "Select exe to use as launcher [1-${#found[@]}]: " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#found[@]} ] \
+      || die "invalid selection"
+    chosen="${found[$((choice-1))]}"
+  fi
+  echo "Selected: $chosen"
+  cmd_menu "$kind" "$name" --exe "$chosen"
+}
+
+cmd_menu() {
+  local kind="$1" name="$2"; valid_name "$name"; shift 2
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  local exe="" display="$name" icon=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --exe) exe="$2"; shift 2 ;;
+      --name) display="$2"; shift 2 ;;
+      --icon) icon="$2"; shift 2 ;;
+      *) die "unknown menu option: $1" ;;
+    esac
+  done
+  [ -n "$exe" ] || die "--exe \"relative/path/App.exe\" is required"
+  [ -f "$appdir/prefix/drive_c/$exe" ] || die "not found: $appdir/prefix/drive_c/$exe"
+
+  json_set_string "$appdir/config.json" "exe" "$exe"
+  json_set_string "$appdir/config.json" "display_name" "$display"
+  [ -n "$icon" ] && json_set_string "$appdir/config.json" "icon" "$icon"
+
+  mkdir -p "$APPDIR_DESKTOP"
+  local desktop="$APPDIR_DESKTOP/winpkg-$name.desktop"
+  local escaped_display; escaped_display="$(desktop_escape "$display")"
+  cat > "$desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$escaped_display
+Exec=$SELF run $kind $name
+Path=$appdir
+Icon=${icon:-wine}
+Terminal=false
+Categories=Application;
+EOF
+  echo "Menu entry created: $desktop"
+}
+
+cmd_run() {
+  local kind="$1" name="$2"; valid_name "$name"; shift 2 || true
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir/prefix" ] || die "no such $kind: $name"
+
+  local exe="${1:-}"
+  if [ -n "$exe" ]; then shift; else
+    exe="$(json_get "$appdir/config.json" exe)"
+    [ -n "$exe" ] || die "no exe configured, run: winpkg scan $kind $name"
+  fi
+  local target="$exe"
+  [[ "$target" != /* ]] && target="$appdir/prefix/drive_c/$exe"
+
+  local runner; runner="$(json_get "$appdir/config.json" runner)"
+  command -v "$runner" >/dev/null || die "runner '$runner' not found on PATH"
+  local env_args=(); build_env_args "$appdir/config.json" env_args
+
+  mkdir -p "$LOGS"
+  local logfile="$LOGS/${kind}-${name}-run-$(date +%Y%m%d-%H%M%S).log"
+  echo "Launching $name... log: $logfile"
+
+  if [ "$kind" = "game" ]; then
+    with_prefix_lock_logged "$appdir/prefix" "$logfile" \
+      env WINEPREFIX="$appdir/prefix" GAMEID="$name" PROTONPATH="${PROTONPATH:-}" \
+        "${env_args[@]}" "$runner" "$target" "$@"
+  else
+    with_prefix_lock_logged "$appdir/prefix" "$logfile" \
+      env WINEPREFIX="$appdir/prefix" "${env_args[@]}" "$runner" "$target" "$@"
+  fi
+}
+
+cmd_set_runner() {
+  local kind="$1" name="$2" runner="$3"; valid_name "$name"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir/prefix" ] || die "no such $kind: $name"
+  command -v "$runner" >/dev/null || echo "warning: '$runner' not currently on PATH"
+  json_set_string "$appdir/config.json" "runner" "$runner"
+  echo "Runner for $name set to: $runner"
+}
+
+cmd_set_env() {
+  local kind="$1" name="$2" key="$3" val="$4"; valid_name "$name"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir/prefix" ] || die "no such $kind: $name"
+  json_set_env "$appdir/config.json" "$key" "$val"
+  echo "Set $key=$val for $name"
+}
+
+cmd_repair() {
+  local kind="$1" name="$2"; valid_name "$name"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir/prefix" ] || die "no such $kind: $name"
+  with_prefix_lock "$appdir/prefix" bash -c '
+    prefix="$1"
+    WINEPREFIX="$prefix" wineserver -k || true
+    WINEPREFIX="$prefix" wineboot -u
+  ' bash "$appdir/prefix"
+  echo "Prefix rebooted/repaired."
+}
+
+cmd_upgrade_prefix() {
+  local kind="$1" name="$2"; valid_name "$name"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir/prefix" ] || die "no such $kind: $name"
+  local autolabel="pre-upgrade-$(date +%Y%m%d%H%M%S)-$$"
+  echo "Auto-snapshotting as '$autolabel' before upgrade..."
+  cmd_snapshot "$kind" "$name" "$autolabel"
+  with_prefix_lock "$appdir/prefix" bash -c '
+    prefix="$1"
+    WINEPREFIX="$prefix" wineserver -k || true
+    WINEPREFIX="$prefix" wineboot -u
+  ' bash "$appdir/prefix"
+  echo "Prefix upgraded. Rollback if needed: winpkg restore $kind $name $autolabel"
+}
+
+cmd_doctor() {
+  local kind="$1" name="$2"; valid_name "$name"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  local ok=1
+
+  echo "winpkg doctor: $kind $name"
+
+  if [ -d "$appdir/prefix" ] && [ -f "$appdir/prefix/system.reg" ]; then
+    echo "  [OK]      prefix exists and looks initialized"
+  else
+    echo "  [MISSING] prefix missing or never booted"
+    ok=0
+  fi
+
+  if [ -f "$appdir/config.json" ]; then
+    local runner exe deps_count
+    runner="$(json_get "$appdir/config.json" runner)"
+    exe="$(json_get "$appdir/config.json" exe)"
+    deps_count="$(python3 -c "import json;print(len(json.load(open('$appdir/config.json'))['deps']))" 2>/dev/null || echo 0)"
+
+    if command -v "$runner" >/dev/null; then
+      echo "  [OK]      runner '$runner' found on PATH"
+    else
+      echo "  [MISSING] runner '$runner' not on PATH"
+      ok=0
+    fi
+
+    if [ -n "$exe" ] && [ -f "$appdir/prefix/drive_c/$exe" ]; then
+      echo "  [OK]      executable found: $exe"
+    elif [ -n "$exe" ]; then
+      echo "  [MISSING] configured exe not found on disk: $exe"
+      ok=0
+    else
+      echo "  [WARN]    no exe configured yet (run winpkg scan/menu)"
+    fi
+
+    echo "  [INFO]    $deps_count dependency verb(s) recorded"
+  else
+    echo "  [MISSING] config.json not found"
+    ok=0
+  fi
+
+  if [ -d "$appdir/prefix" ]; then
+    if flock -n -x "$appdir/prefix/.lock" -c true 2>/dev/null; then
+      echo "  [OK]      prefix lock currently available (nothing running)"
+    else
+      echo "  [WARN]    prefix lock busy (something running, or stale lock)"
+    fi
+  fi
+
+  if [ "$ok" -eq 1 ]; then
+    echo "Result: healthy"
+  else
+    echo "Result: needs attention"
+    return 1
+  fi
+}
+
+cmd_info() {
+  local kind="$1" name="$2"; valid_name "$name"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -f "$appdir/config.json" ] || die "no such $kind: $name"
+  local disk_usage; disk_usage="$(du -sh "$appdir/prefix" 2>/dev/null | cut -f1)"
+  local snap_count; snap_count="$(find "$appdir/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+  python3 - "$appdir/config.json" "$appdir/prefix" "$disk_usage" "$snap_count" <<'EOF'
+import json, sys
+cfg, prefix, disk_usage, snap_count = sys.argv[1:5]
+d = json.load(open(cfg))
+print(f"Name:            {d['name']}")
+print(f"Kind:            {d['kind']}")
+print(f"Schema:          {d.get('schema')}  (manager {d.get('manager_version', '?')})")
+print(f"Wine arch:       {d.get('wine_arch')}")
+print(f"Wine version:    {d.get('wine_version')}")
+print(f"Runner:          {d['runner']}")
+print(f"Prefix:          {prefix}")
+print(f"Disk usage:      {disk_usage or '?'}")
+print(f"Snapshots:       {snap_count}")
+print(f"Created:         {d['created']}")
+if d.get("restored_from"):
+    print(f"Restored from:   {d['restored_from']} (at {d.get('restored_at')})")
+print(f"Installer:       {d.get('installer') or '-'}")
+print("Dependencies:")
+if d["deps"]:
+    for dep in d["deps"]:
+        print(f"  {dep}")
+else:
+    print("  (none)")
+env = d.get("env", {})
+print("Env:")
+if env:
+    for k, v in env.items():
+        print(f"  {k}={v}")
+else:
+    print("  (none)")
+print(f"Executable:      {d.get('exe') or '(not set, run winpkg scan or menu)'}")
+EOF
+}
+
+cmd_list() {
+  for kind in apps games; do
+    local dir="$WINPKG_HOME/$kind"
+    [ -d "$dir" ] || continue
+    for d in "$dir"/*/; do
+      [ -d "$d" ] || continue
+      local n; n="$(basename "$d")"
+      local deps
+      deps="$(python3 -c "
+import json
+try:
+    d = json.load(open('$d/config.json'))
+    print(', '.join(d.get('deps', [])) or '-')
+except Exception as e:
+    print(f'<broken config.json: {e}>')
+" 2>/dev/null || echo "<unreadable>")"
+      echo "${kind%s}  $n  deps: $deps"
+    done
+  done
+}
+
+# --- status: pacman-style one-screen overview of everything installed ---
+cmd_status() {
+  local total=0
+  printf "%-5s %-18s %-10s %-6s %-10s %s\n" "KIND" "NAME" "RUNNER" "READY" "DEPS" "DISK"
+  for kind in apps games; do
+    local dir="$WINPKG_HOME/$kind"
+    [ -d "$dir" ] || continue
+    for d in "$dir"/*/; do
+      [ -d "$d" ] || continue
+      total=$((total+1))
+      local n; n="$(basename "$d")"
+      local cfg="$d/config.json"
+      local runner="?" ready="?" depcount="0"
+      if [ -f "$cfg" ]; then
+        runner="$(python3 -c "import json;print(json.load(open('$cfg')).get('runner','?'))" 2>/dev/null || echo "?")"
+        local exe; exe="$(python3 -c "import json;print(json.load(open('$cfg')).get('exe') or '')" 2>/dev/null || echo "")"
+        [ -n "$exe" ] && [ -f "$d/prefix/drive_c/$exe" ] && ready="yes" || ready="no"
+        depcount="$(python3 -c "import json;print(len(json.load(open('$cfg')).get('deps',[])))" 2>/dev/null || echo 0)"
+      fi
+      local disk; disk="$(du -sh "$d/prefix" 2>/dev/null | cut -f1)"
+      printf "%-5s %-18s %-10s %-6s %-10s %s\n" "${kind%s}" "$n" "$runner" "$ready" "$depcount" "${disk:-?}"
+    done
+  done
+  [ "$total" -gt 0 ] || echo "(nothing installed yet - try: winpkg build app NAME /path/to/setup.exe)"
+}
+
+# --- build: the one command you actually need after `winpkg init`.
+#     winpkg build app|game NAME INSTALLER [DEP...] [--name "Display"] [--icon PATH]
+#     - creates the prefix if it doesn't exist yet (safe to re-run: reuses it)
+#     - installs any trailing dep verbs first
+#     - runs the installer (auto-snapshotted, so it's undoable)
+#     - scans for the exe and wires up a menu entry automatically, unless
+#       ambiguous, in which case it asks once
+cmd_build() {
+  local kind="$1" name="$2" installer="$3"; valid_name "$name"; shift 3
+
+  local display="" icon="" deps=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) display="$2"; shift 2 ;;
+      --icon) icon="$2"; shift 2 ;;
+      *) deps+=("$1"); shift ;;
+    esac
+  done
+
+  if [ ! -d "$TEMPLATE" ]; then
+    echo "No template yet, running 'winpkg init' first..."
+    cmd_init
+  fi
+
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  if [ -d "$appdir/prefix" ]; then
+    echo "'$name' already exists, reusing its prefix."
+  else
+    cmd_create "$kind" "$name"
+  fi
+
+  if [ ${#deps[@]} -gt 0 ]; then
+    cmd_deps "$kind" "$name" "${deps[@]}"
+  fi
+
+  cmd_install "$kind" "$name" "$installer"
+
+  if [ -n "$display" ] || [ -n "$icon" ]; then
+    # user gave menu details but not necessarily --exe: scan first, then
+    # relabel with the requested display/icon.
+    cmd_scan "$kind" "$name"
+    local exe; exe="$(json_get "$appdir/config.json" exe)"
+    local menu_args=(--exe "$exe")
+    [ -n "$display" ] && menu_args+=(--name "$display")
+    [ -n "$icon" ] && menu_args+=(--icon "$icon")
+    cmd_menu "$kind" "$name" "${menu_args[@]}"
+  else
+    cmd_scan "$kind" "$name"
+  fi
+
+  echo ""
+  echo "Done. '$name' is ready:"
+  echo "  launch from your app menu, or: winpkg run $kind $name"
+  echo "  status:                        winpkg status"
+}
+
+cmd_remove() {
+  local kind="$1" name="$2"; valid_name "$name"; shift 2
+  local yes=0 purge=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y) yes=1; shift ;;
+      --purge) purge=1; shift ;;
+      *) die "unknown remove option: $1" ;;
+    esac
+  done
+
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -d "$appdir" ] || die "no such $kind: $name"
+  assert_safe_path "$appdir"
+
+  local disk_usage snap_count
+  disk_usage="$(du -sh "$appdir" 2>/dev/null | cut -f1)"
+  snap_count="$(find "$appdir/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+
+  if [ "$yes" -ne 1 ]; then
+    echo "About to remove $kind '$name'"
+    echo "  path:      $appdir"
+    echo "  disk:      ${disk_usage:-?}"
+    echo "  snapshots: $snap_count"
+    if [ "$purge" -eq 1 ]; then
+      echo "  mode:      PERMANENT DELETE (--purge)"
+    else
+      echo "  mode:      move to trash (recoverable: winpkg trash-restore $kind $name)"
+    fi
+    read -rp "Type the name '$name' to confirm: " confirm
+    [ "$confirm" = "$name" ] || die "confirmation did not match, aborted"
+  fi
+
+  if [ "$purge" -eq 1 ]; then
+    if [ -d "$appdir/prefix" ]; then
+      with_prefix_lock "$appdir/prefix" rm -rf "${appdir:?}"
+    else
+      rm -rf "${appdir:?}"
+    fi
+    echo "Permanently deleted $kind '$name'."
+  else
+    mkdir -p "$TRASH"
+    local dest="$TRASH/${kind}-${name}-$(date +%Y%m%d%H%M%S)"
+    if [ -d "$appdir/prefix" ]; then
+      with_prefix_lock "$appdir/prefix" mv "$appdir" "$dest"
+    else
+      mv "$appdir" "$dest"
+    fi
+    echo "Moved to trash: $dest"
+    echo "Restore with: winpkg trash-restore $kind $name"
+    echo "Permanently delete everything in trash with: winpkg trash-empty"
+  fi
+  rm -f "$APPDIR_DESKTOP/winpkg-$name.desktop"
+}
+
+cmd_trash_list() {
+  mkdir -p "$TRASH"
+  local any=0
+  for d in "$TRASH"/*/; do
+    [ -d "$d" ] || continue
+    any=1
+    echo "$(basename "$d")"
+  done
+  [ "$any" -eq 1 ] || echo "(trash is empty)"
+}
+
+cmd_trash_restore() {
+  local kind="$1" name="$2"; valid_name "$name"
+  local appdir; appdir="$(appdir_of "$kind" "$name")"
+  [ -e "$appdir" ] && die "'$name' already exists under $kind, remove/rename it first"
+  mkdir -p "$TRASH"
+  local match
+  match="$(find "$TRASH" -maxdepth 1 -type d -name "${kind}-${name}-*" | sort -r | head -n1 || true)"
+  [ -n "$match" ] || die "nothing in trash for $kind $name"
+  mv "$match" "$appdir"
+  echo "Restored $kind '$name' from trash: $match -> $appdir"
+}
+
+cmd_trash_empty() {
+  mkdir -p "$TRASH"
+  assert_safe_path "$TRASH"
+  if [ "${1:-}" = "--older-than" ] && [ -n "${2:-}" ]; then
+    echo "Deleting trash entries older than $2 day(s)..."
+    find "$TRASH" -mindepth 1 -maxdepth 1 -type d -mtime "+$2" -print -exec rm -rf {} \;
+    return 0
+  fi
+  local count; count="$(find "$TRASH" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+  [ "$count" -gt 0 ] || { echo "Trash is already empty."; return 0; }
+  echo "This will permanently delete $count item(s) from trash."
+  read -rp "Type 'yes' to confirm: " confirm
+  [ "$confirm" = "yes" ] || die "aborted"
+  find "$TRASH" -mindepth 1 -maxdepth 1 -exec rm -rf {} \;
+  echo "Trash emptied."
+}
+
+usage() {
+  cat <<EOF
+winpkg $MANAGER_VERSION - Wine app/game manager (Arch/CachyOS)
+
+THE TWO COMMANDS YOU ACTUALLY NEED:
+
+  winpkg init                                             (once, ever)
+  winpkg build app|game NAME INSTALLER [DEP...]            build + wire up, one shot
+  winpkg status                                            pacman-style overview
+
+Example:
+  winpkg init
+  winpkg build app office365 ~/Downloads/OfficeSetup.exe vcrun2022 dotnet48 msxml6
+  winpkg status
+  winpkg run app office365          # or just launch it from your app menu
+
+Everything else (still here for fine-grained control):
+
+  winpkg create app|game NAME                  new empty prefix
+  winpkg deps   app|game NAME VERB...           winetricks verbs, auto-snapshots first
+  winpkg install app|game NAME INSTALLER       run installer, auto-snapshots first
+  winpkg scan   app|game NAME                   find/pick the launcher exe
+  winpkg menu   app|game NAME --exe PATH        write .desktop entry manually
+  winpkg run    app|game NAME [EXE] [ARGS]      launch
+  winpkg clone  app|game SRC DST
+  winpkg snapshot/restore/snapshots/snapshot-remove app|game NAME [LABEL]
+  winpkg set-runner app|game NAME RUNNER        wine, wine-staging, umu-run, ...
+  winpkg set-env    app|game NAME KEY VAL
+  winpkg repair / upgrade-prefix / doctor / info  app|game NAME
+  winpkg list                                   plain listing
+  winpkg remove app|game NAME [--yes] [--purge] trash by default, --purge deletes for real
+  winpkg trash-list / trash-restore / trash-empty [--older-than DAYS]
+
+Games respect \$PROTONPATH if set:
+  bash/zsh:  export PROTONPATH=\$HOME/cachyos-Proton
+  fish:      set -x PROTONPATH \$HOME/cachyos-Proton
+EOF
+}
+
+main() {
+  [ $# -ge 1 ] || { usage; exit 1; }
+  local cmd="$1"; shift
+  case "$cmd" in
+    init)            cmd_init "$@" ;;
+    build)           cmd_build "$@" ;;
+    status)          cmd_status "$@" ;;
+    create)          cmd_create "$@" ;;
+    clone)           cmd_clone "$@" ;;
+    snapshot)        cmd_snapshot "$@" ;;
+    restore)         cmd_restore "$@" ;;
+    snapshots)       cmd_snapshots "$@" ;;
+    snapshot-remove) cmd_snapshot_remove "$@" ;;
+    deps)            cmd_deps "$@" ;;
+    install)         cmd_install "$@" ;;
+    scan)            cmd_scan "$@" ;;
+    menu)            cmd_menu "$@" ;;
+    run)             cmd_run "$@" ;;
+    set-runner)      cmd_set_runner "$@" ;;
+    set-env)         cmd_set_env "$@" ;;
+    repair)          cmd_repair "$@" ;;
+    upgrade-prefix)  cmd_upgrade_prefix "$@" ;;
+    doctor)          cmd_doctor "$@" ;;
+    info)            cmd_info "$@" ;;
+    list)            cmd_list "$@" ;;
+    remove)          cmd_remove "$@" ;;
+    trash-list)      cmd_trash_list "$@" ;;
+    trash-restore)   cmd_trash_restore "$@" ;;
+    trash-empty)     cmd_trash_empty "$@" ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
