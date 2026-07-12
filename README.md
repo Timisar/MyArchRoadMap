@@ -135,3 +135,7 @@ winpkg --help
 ---
 
 **That’s it.** Go build something. 
+<details>
+  Tips For r/Piracy
+  <Summary> FitGirls games can be install with it</Summary>
+</details>
