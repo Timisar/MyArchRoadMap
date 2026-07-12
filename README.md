@@ -1,104 +1,137 @@
-Just My Cachyos Projects:
+#Disclamer!!!
 
+Still in beta testing. Trying to release a Gui based support to in QML in future.
 
-# winpkg
+# winpkg – Wine/Proton app & game manager
 
-A small tool for installing and running Windows apps/games on Arch/CachyOS via Wine, without hand-managing prefixes yourself.
+> One‑line setup for Windows apps/games on Arch/CachyOS.  
+> Uses **reflinks** (Btrfs) to share a single pre‑baked Wine prefix – pay the download cost **once**, create any number of apps instantly.
 
-## Setup (fish shell)
+---
 
-Assuming you are using fish shell like me:
+## Quickstart
 
-```fish
-mkdir -p ~/.local/bin
-mv ~/Downloads/winpkg ~/.local/bin/
-chmod +x ~/.local/bin/winpkg
-fish_add_path ~/.local/bin
+```bash
+# 1. Install the script (make executable)
+chmod +x winpkg
+sudo mv winpkg /usr/local/bin/   # or keep it anywhere in PATH
+
+# 2. Build the shared template (one‑time, downloads VC++/.NET/etc.)
+winpkg init
+
+# 3. Build your app/game (everything in one go)
+winpkg build game RDR ~/Downloads/setup.exe vcrun2022   # for games (uses umu‑run)
+# or
+winpkg build app Office ~/Downloads/OfficeSetup.exe      # for apps (uses wine)
+
+# 4. Launch
+winpkg run game RDR           # terminal
+# or click the "RDR" icon in your system menu
 ```
 
-`fish_add_path` persists automatically — no need to edit `config.fish`. Verify:
+---
 
-```fish
-which winpkg
+## What it does
+
+- Creates isolated prefixes under `~/.local/share/winpkg/`
+- Apps (`app`) use `wine`; games (`game`) use `umu‑run` (Proton)
+- Automatically detects the main `.exe` and creates a `.desktop` launcher
+- Snapshots every install/deps change – rollback any time
+- Manages dependencies (winetricks verbs) per app
+
+---
+
+## Commands (the ones you’ll use)
+
+| Command | Purpose |
+|---------|---------|
+| `winpkg init` | Build shared template (VC++ 2005–2022, .NET 3.5/4.8/6/7/8, corefonts) – run once |
+| `winpkg build app\|game NAME INSTALLER [DEPS...]` | Full build: create prefix, install deps, run installer, create menu entry |
+| `winpkg run app\|game NAME` | Launch the app/game |
+| `winpkg status` | Overview of all installed apps/games |
+| `winpkg doctor app\|game NAME` | Check if everything is healthy |
+| `winpkg remove app\|game NAME` | Move to trash (recoverable) |
+| `winpkg info app\|game NAME` | Show full config and paths |
+| `winpkg snapshot/restore app\|game NAME LABEL` | Save/restore a prefix state |
+
+---
+
+## Examples
+
+### Build a game with extra deps
+```bash
+winpkg build game Cyberpunk ~/Downloads/setup.exe vcrun2022 dotnet48
 ```
 
-<details>
-<summary>Older fish (no fish_add_path)</summary>
-
-Add to `~/.config/fish/config.fish`:
-
-```fish
-if not contains $HOME/.local/bin $PATH
-    set -U fish_user_paths $HOME/.local/bin $fish_user_paths
-end
+### Build and pass installer arguments
+```bash
+winpkg build app Office ~/Downloads/setup.exe -- /quiet /norestart
 ```
 
-Then restart your terminal or `source ~/.config/fish/config.fish`.
-</details>
-
-## Usage
-
-winpkg always lives in `~/.local/share/winpkg` — it doesn't matter what directory you're in when you run these commands.
-
-```fish
-winpkg init         
+### Manually set the executable (skip auto‑scan)
+```bash
+winpkg build game RDR ~/Downloads/setup.exe --exe "Program Files/RDR/RDR.exe"
 ```
 
-Build (install + set up a launcher) for an app:
-
-```fish
-winpkg build app testapp ~/Downloads/something-small.exe
-winpkg status
-winpkg run app testapp
+### Use custom Proton (set once in your shell)
+```bash
+export PROTONPATH="$HOME/.local/share/Steam/compatibilitytools.d/cachyos-proton"
+winpkg build game MyGame ~/Downloads/setup.exe
 ```
 
-`winpkg build` will sometimes stop and ask you to pick an `.exe` — only when it finds more than one candidate (e.g. Office offering `WINWORD.EXE`, `EXCEL.EXE`, ...). If there's only one, it picks it automatically.
+---
 
-For dependencies (VC++ runtimes, .NET, etc.), pass them after the installer:
+## Requirements
 
-```fish
-winpkg build app office365 ~/Downloads/OfficeSetup.exe vcrun2022 dotnet48 msxml6
+- Arch/CachyOS (or any distribution with `wine`, `winetricks`, `python3`, `curl`, `util‑linux`, `fontconfig`)
+- **Btrfs** recommended for reflink (zero‑copy); falls back to full copy otherwise
+- For games: `umu-launcher` (install with `yay -S umu-launcher`)
+
+---
+
+## Directory layout
+
+```
+~/.local/share/winpkg/
+  template/             shared prefix (reflinked to all apps)
+  apps/<name>/          each app’s prefix + config + snapshots
+  games/<name>/         each game’s prefix + config + snapshots
+  installers/           cached downloads
+  logs/                 run logs
+  trash/                soft‑deleted apps/games
 ```
 
-For games, use `game` instead of `app` — this uses `umu-run`/Proton instead of plain Wine:
+---
 
-```fish
-winpkg build game cyberpunk ~/Downloads/setup.exe
+## Rollback
+
+Every `deps` or `install` creates an automatic snapshot.  
+To restore:
+
+```bash
+winpkg snapshots game RDR          # list snapshots
+winpkg restore game RDR pre-install-20260115-123456
 ```
 
-## If things go wrong
+---
 
-**`winpkg init` fails** — `wine`/`winetricks` probably aren't installed:
+## Uninstall
 
-```fish
-sudo pacman -S wine winetricks
+```bash
+winpkg remove game RDR            # moves to trash (recoverable)
+winpkg trash-empty                # permanently delete trash
 ```
 
-If pacman says "target not found," `[multilib]` isn't enabled — uncomment it in `/etc/pacman.conf`, then `sudo pacman -Sy` and retry.
+---
 
-**Games need `umu-launcher`** (AUR, not in the main repos):
+## Full reference
 
-```fish
-paru -S umu-launcher
+All advanced commands (`create`, `deps`, `install`, `scan`, `menu`, `set‑runner`, `set‑env`, `repair`, `upgrade‑prefix`, `clone`, `snapshot‑remove`) are documented in the script’s `--help`:
+
+```bash
+winpkg --help
 ```
 
-**An install/update broke something** — every `deps`/`install` auto-snapshots first, so roll back:
+---
 
-##Example
-```fish
-winpkg snapshots app office365          
-winpkg restore app office365 pre-install-20260711123456
-```
-
-**Something's just acting weird** — check its health:
-
-```fish
-winpkg doctor app office365
-```
-
-**Deleted something by mistake** — `remove` moves to trash by default, it doesn't delete outright:
-
-```fish
-winpkg trash-list
-winpkg trash-restore app office365
-```
+**That’s it.** Go build something. 
