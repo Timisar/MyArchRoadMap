@@ -23,16 +23,38 @@ set -euo pipefail
 MANAGER_VERSION="9.0"
 WINPKG_HOME="${WINPKG_HOME:-$HOME/.local/share/winpkg}"
 TEMPLATE="$WINPKG_HOME/template/prefix"
+TEMPLATE_MANIFEST="$WINPKG_HOME/template/manifest.json"
 INSTALLERS="$WINPKG_HOME/installers"
 RUNTIME_CACHE="$WINPKG_HOME/runtime/winetricks-cache"
 LOGS="$WINPKG_HOME/logs"
 TRASH="$WINPKG_HOME/trash"
 APPDIR_DESKTOP="$HOME/.local/share/applications"
+
+# Baked into the shared template ONCE by `winpkg init`, so every app/game
+# created afterward inherits these via reflink - no re-downloading VC++/.NET
+# for every single app. This is the actual point of the template/reflink
+# design: pay the download cost once, get it free forever after.
+TEMPLATE_DEPS_DEFAULT=(
+  corefonts
+  vcrun2005 vcrun2008 vcrun2010 vcrun2012 vcrun2013 vcrun2022
+  dotnet35 dotnet48
+  dotnetdesktop6 dotnetdesktop7 dotnetdesktop8
+)
 SELF="$(readlink -f "$0")"
 
 die() { echo "winpkg: $*" >&2; exit 1; }
 
 command -v flock >/dev/null || die "flock not found (pacman -S util-linux)"
+command -v python3 >/dev/null || die "python3 not found (pacman -S python)"
+command -v curl >/dev/null || die "curl not found (pacman -S curl)"
+
+# Only checked when the command actually needs it, so `winpkg status` etc.
+# still work fine on a box that hasn't got wine set up yet.
+require_wine_stack() {
+  command -v wine >/dev/null || die "wine not found (pacman -S wine, and enable [multilib] first)"
+  command -v winetricks >/dev/null || die "winetricks not found (pacman -S winetricks)"
+  command -v script >/dev/null || die "script not found (pacman -S util-linux)"
+}
 
 valid_name() {
   [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid name: '$1' (letters, digits, . _ - only)"
@@ -83,9 +105,14 @@ json_init() {
   if [ "$kind" = "app" ] && command -v wine >/dev/null; then
     wine_version="$(wine --version 2>/dev/null || echo unknown)"
   fi
-  python3 - "$cfg" "$kind" "$name" "$default_runner" "$wine_version" "$MANAGER_VERSION" <<'EOF'
+  local template_deps="[]"
+  if [ -f "$TEMPLATE_MANIFEST" ]; then
+    template_deps="$(python3 -c "import json;print(json.dumps(json.load(open('$TEMPLATE_MANIFEST')).get('deps', [])))" 2>/dev/null || echo "[]")"
+  fi
+  python3 - "$cfg" "$kind" "$name" "$default_runner" "$wine_version" "$MANAGER_VERSION" "$template_deps" <<'EOF'
 import json, sys, datetime
-cfg, kind, name, runner, wine_version, mgr = sys.argv[1:7]
+cfg, kind, name, runner, wine_version, mgr, template_deps_json = sys.argv[1:8]
+template_deps = json.loads(template_deps_json)
 data = {
     "schema": 2,
     "manager_version": mgr,
@@ -93,7 +120,10 @@ data = {
     "created": datetime.datetime.now().isoformat(timespec="seconds"),
     "wine_arch": "win64",
     "wine_version": wine_version,
-    "deps": [], "exe": None, "display_name": name, "icon": None,
+    # inherited from the shared template via reflink - already installed,
+    # not something `deps`/`build` needs to (re-)download
+    "deps": list(template_deps),
+    "exe": None, "display_name": name, "icon": None,
     "installer": None, "runner": runner, "env": {},
 }
 json.dump(data, open(cfg, "w"), indent=2)
@@ -193,8 +223,13 @@ with_prefix_lock() {
 with_prefix_lock_logged() {
   local prefix="$1" logfile="$2"; shift 2
   with_prefix_lock "$prefix" bash -c '
+    set -o pipefail
     logfile="$1"; shift
-    "$@" 2>&1 | tee "$logfile"
+    # run under a fake tty via `script` so wget/wine emit their normal
+    # compact live progress instead of falling back to non-tty dot-spam
+    # output (which is what happens when their stdout is a plain pipe)
+    cmd="$(printf "%q " "$@")"
+    script -qefc "$cmd" /dev/null 2>&1 | tee "$logfile"
   ' bash "$logfile" "$@"
 }
 
@@ -219,18 +254,147 @@ safe_installer_name() {
   echo "$base"
 }
 
-desktop_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
+desktop_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/;/\\;/g' -e 's/%/%%/g' | tr '\n\t' '  '
+}
+
+# Copies font files into a prefix's Fonts folder AND registers them in Wine's
+# registry (HKLM\...\CurrentVersion\Fonts), so apps that look up fonts by
+# exact name (e.g. CreateFont("Segoe UI")) actually find them - just dropping
+# the files in isn't enough. Uses fc-scan to read each font's real family/
+# style name instead of guessing from the filename.
+install_fonts_into_prefix() {
+  local prefix="$1" src="$2"
+  local fontdir="$prefix/drive_c/windows/Fonts"
+  mkdir -p "$fontdir"
+
+  find "$src" -maxdepth 1 -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.ttc' \) \
+    -exec cp -n {} "$fontdir/" \;
+
+  local regfile; regfile="$(mktemp --suffix=.reg)"
+  {
+    echo "REGEDIT4"
+    echo ""
+    echo '[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\Fonts]'
+    while IFS= read -r -d '' f; do
+      local base family style regname
+      base="$(basename "$f")"
+      family="$(fc-scan --format '%{family[0]}' "$f" 2>/dev/null || true)"
+      style="$(fc-scan --format '%{style[0]}' "$f" 2>/dev/null || true)"
+      [ -n "$family" ] || continue
+      if [ -n "$style" ] && [ "$style" != "Regular" ]; then
+        regname="$family $style (TrueType)"
+      else
+        regname="$family (TrueType)"
+      fi
+      regname="${regname//\\/\\\\}"
+      regname="${regname//\"/\\\"}"
+      printf '"%s"="%s"\n' "$regname" "$base"
+    done < <(find "$fontdir" -maxdepth 1 -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.ttc' \) -print0)
+  } > "$regfile"
+
+  WINEPREFIX="$prefix" wine regedit "$regfile" >/dev/null 2>&1 || true
+  rm -f "$regfile"
+}
+
+cmd_add_fonts() {
+  local src="$1"; shift || true
+  [ -d "$src" ] || die "not a directory: $src"
+  command -v fc-scan >/dev/null || die "fc-scan not found (pacman -S fontconfig)"
+  command -v wine >/dev/null || die "wine not found on PATH"
+
+  local target_prefix="$TEMPLATE" target_desc="shared template"
+  if [ "${1:-}" = "--target" ]; then
+    local kind="$2" name="$3"; valid_name "$name"
+    local appdir; appdir="$(appdir_of "$kind" "$name")"
+    [ -d "$appdir/prefix" ] || die "no such $kind: $name"
+    target_prefix="$appdir/prefix"
+    target_desc="$kind $name"
+  fi
+  [ -d "$target_prefix" ] || die "no template yet, run: winpkg init"
+
+  echo "Installing fonts from $src into $target_desc ..."
+  with_prefix_lock "$target_prefix" install_fonts_into_prefix "$target_prefix" "$src"
+
+  local count
+  count="$(find "$target_prefix/drive_c/windows/Fonts" -maxdepth 1 -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.ttc' \) 2>/dev/null | wc -l)"
+  echo "Done. $count font file(s) now present and registered in $target_desc."
+
+  if [ "$target_prefix" = "$TEMPLATE" ]; then
+    echo "Note: this only affects the TEMPLATE. Apps/games created before now"
+    echo "won't inherit these fonts retroactively (reflink already happened)."
+    echo "For an existing app: winpkg add-fonts $src --target app NAME"
+  fi
+}
 
 cmd_init() {
   mkdir -p "$WINPKG_HOME"/{apps,games,installers,logs,trash} "$WINPKG_HOME/template" "$RUNTIME_CACHE"
+
+  local want=("${TEMPLATE_DEPS_DEFAULT[@]}")
+  [ "${1:-}" = "--minimal" ] && want=(corefonts)
+
   if [ ! -d "$TEMPLATE" ]; then
-    echo "Creating minimal template prefix at $TEMPLATE ..."
+    require_wine_stack
+    echo "Creating template prefix at $TEMPLATE ..."
     WINEPREFIX="$TEMPLATE" WINEARCH=win64 wineboot --init
-    WINETRICKS_CACHE="$RUNTIME_CACHE" WINEPREFIX="$TEMPLATE" winetricks -q corefonts
-    echo "Template ready (fonts + wine defaults only, on purpose)."
-  else
-    echo "Template already exists at $TEMPLATE"
+    python3 - "$TEMPLATE_MANIFEST" <<'EOF'
+import json, sys, datetime
+json.dump({"deps": [], "created": datetime.datetime.now().isoformat(timespec="seconds")},
+           open(sys.argv[1], "w"), indent=2)
+EOF
   fi
+
+  # idempotent: diff what's wanted against what the manifest says is already
+  # baked in, only install the gap. Safe to run winpkg init again and again -
+  # existing folders/prefix/deps are left alone, missing ones get filled in.
+  local have=()
+  if [ -f "$TEMPLATE_MANIFEST" ]; then
+    mapfile -t have < <(python3 -c "import json;print('\n'.join(json.load(open('$TEMPLATE_MANIFEST'))['deps']))" 2>/dev/null)
+  fi
+
+  local missing=()
+  for v in "${want[@]}"; do
+    local found=0
+    for h in "${have[@]}"; do [ "$h" = "$v" ] && { found=1; break; }; done
+    [ "$found" -eq 1 ] || missing+=("$v")
+  done
+
+  if [ ${#missing[@]} -eq 0 ]; then
+    echo "Template up to date at $TEMPLATE (nothing missing, nothing to do)."
+    return 0
+  fi
+
+  require_wine_stack
+  echo "Template exists but is missing ${#missing[@]} component(s), installing:"
+  printf '  %s\n' "${missing[@]}"
+  WINETRICKS_CACHE="$RUNTIME_CACHE" WINEPREFIX="$TEMPLATE" winetricks -q "${missing[@]}"
+
+  python3 - "$TEMPLATE_MANIFEST" "${missing[@]}" <<'EOF'
+import json, sys, datetime
+manifest, new_deps = sys.argv[1], sys.argv[2:]
+d = json.load(open(manifest))
+for v in new_deps:
+    if v not in d["deps"]:
+        d["deps"].append(v)
+d["created"] = d.get("created") or datetime.datetime.now().isoformat(timespec="seconds")
+d["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+json.dump(d, open(manifest, "w"), indent=2)
+EOF
+  echo "Template updated. Existing apps/games do NOT get this retroactively (already reflinked)."
+}
+
+cmd_template_info() {
+  [ -f "$TEMPLATE_MANIFEST" ] || die "no template yet, run: winpkg init"
+  python3 - "$TEMPLATE_MANIFEST" "$TEMPLATE" <<'EOF'
+import json, sys
+manifest, prefix = sys.argv[1], sys.argv[2]
+d = json.load(open(manifest))
+print(f"Template prefix: {prefix}")
+print(f"Built:            {d.get('created')}")
+print("Baked-in dependencies (every new app/game starts with these already installed):")
+for dep in d.get("deps", []):
+    print(f"  {dep}")
+EOF
 }
 
 cmd_create() {
@@ -413,8 +577,14 @@ cmd_deps() {
   mkdir -p "$RUNTIME_CACHE" "$LOGS"
   local logfile="$LOGS/${kind}-${name}-deps-$(date +%Y%m%d-%H%M%S).log"
   echo "Installing deps into $name: ${todo[*]}"
+  local rc=0
   with_prefix_lock_logged "$appdir/prefix" "$logfile" \
-    env WINEPREFIX="$appdir/prefix" WINETRICKS_CACHE="$RUNTIME_CACHE" winetricks -q "${todo[@]}"
+    env WINEPREFIX="$appdir/prefix" WINETRICKS_CACHE="$RUNTIME_CACHE" winetricks -q "${todo[@]}" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "winetricks exited with code $rc, NOT recording these as installed: ${todo[*]}" >&2
+    echo "Log: $logfile" >&2
+    return "$rc"
+  fi
   json_add_deps "$appdir/config.json" "${todo[@]}"
   echo "Recorded in $appdir/config.json -> deps"
 }
@@ -445,21 +615,28 @@ cmd_install() {
   mkdir -p "$LOGS"
   local logfile="$LOGS/${kind}-${name}-install-$(date +%Y%m%d-%H%M%S).log"
   echo "Running installer in $name's prefix (runner: $runner)... log: $logfile"
+  local rc=0
   if [ "$kind" = "game" ]; then
     with_prefix_lock_logged "$appdir/prefix" "$logfile" \
       env WINEPREFIX="$appdir/prefix" GAMEID="$name" PROTONPATH="${PROTONPATH:-}" \
-        "${env_args[@]}" "$runner" "$installer_path" "$@"
+        "${env_args[@]}" "$runner" "$installer_path" "$@" || rc=$?
   else
     with_prefix_lock_logged "$appdir/prefix" "$logfile" \
-      env WINEPREFIX="$appdir/prefix" "${env_args[@]}" "$runner" "$installer_path" "$@"
+      env WINEPREFIX="$appdir/prefix" "${env_args[@]}" "$runner" "$installer_path" "$@" || rc=$?
   fi
   json_set_string "$appdir/config.json" "installer" "$installer_path"
+  if [ "$rc" -ne 0 ]; then
+    echo "Installer exited with code $rc. Log: $logfile" >&2
+    echo "Rollback if needed: winpkg restore $kind $name $autolabel" >&2
+    return "$rc"
+  fi
   echo "(rollback if needed: winpkg restore $kind $name $autolabel)"
 }
 
-# --- scan: now supports a non-interactive mode (auto-picks when there's
-#     exactly one candidate) so `build` can run start-to-finish unattended
-#     whenever possible, and only prompts when it's genuinely ambiguous. ---
+# --- scan: auto-picks when there's exactly one candidate. When there are
+#     several, prompts interactively IF stdin is a real terminal; otherwise
+#     (scripted/non-interactive use) it fails with the full list instead of
+#     hanging forever on a `read` nobody can answer. ---
 cmd_scan() {
   local kind="$1" name="$2"; valid_name "$name"
   local appdir; appdir="$(appdir_of "$kind" "$name")"
@@ -470,7 +647,6 @@ cmd_scan() {
     find "$drive_c" -iname "*.exe" \
       -not -ipath "*/windows/*" \
       -not -iname "unins*.exe" \
-      -not -iname "vc_redist*.exe" \
       2>/dev/null | sed "s|^$drive_c/||"
   )
   [ ${#found[@]} -gt 0 ] || die "no candidate .exe files found under drive_c"
@@ -479,7 +655,7 @@ cmd_scan() {
   if [ ${#found[@]} -eq 1 ]; then
     chosen="${found[0]}"
     echo "Only one candidate exe found, using it: $chosen"
-  else
+  elif [ -t 0 ]; then
     echo "Found:"
     local i=1
     for f in "${found[@]}"; do
@@ -490,6 +666,10 @@ cmd_scan() {
     [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#found[@]} ] \
       || die "invalid selection"
     chosen="${found[$((choice-1))]}"
+  else
+    echo "Multiple candidate exe files found and no terminal to ask interactively:" >&2
+    printf '  %s\n' "${found[@]}" >&2
+    die "run 'winpkg menu $kind $name --exe \"<one of the above>\"' to pick one directly"
   fi
   echo "Selected: $chosen"
   cmd_menu "$kind" "$name" --exe "$chosen"
@@ -542,6 +722,7 @@ cmd_run() {
   fi
   local target="$exe"
   [[ "$target" != /* ]] && target="$appdir/prefix/drive_c/$exe"
+  [ -f "$target" ] || die "exe not found on disk: $target (run: winpkg doctor $kind $name)"
 
   local runner; runner="$(json_get "$appdir/config.json" runner)"
   command -v "$runner" >/dev/null || die "runner '$runner' not found on PATH"
@@ -549,16 +730,26 @@ cmd_run() {
 
   mkdir -p "$LOGS"
   local logfile="$LOGS/${kind}-${name}-run-$(date +%Y%m%d-%H%M%S).log"
-  echo "Launching $name... log: $logfile"
+  echo "Launching $name..."
 
+  local rc=0
   if [ "$kind" = "game" ]; then
     with_prefix_lock_logged "$appdir/prefix" "$logfile" \
       env WINEPREFIX="$appdir/prefix" GAMEID="$name" PROTONPATH="${PROTONPATH:-}" \
-        "${env_args[@]}" "$runner" "$target" "$@"
+        "${env_args[@]}" "$runner" "$target" "$@" || rc=$?
   else
     with_prefix_lock_logged "$appdir/prefix" "$logfile" \
-      env WINEPREFIX="$appdir/prefix" "${env_args[@]}" "$runner" "$target" "$@"
+      env WINEPREFIX="$appdir/prefix" "${env_args[@]}" "$runner" "$target" "$@" || rc=$?
   fi
+
+  if [ "$rc" -ne 0 ]; then
+    echo "" >&2
+    echo "$name exited with an error (code $rc)." >&2
+    echo "Full output: $logfile" >&2
+    echo "Check prefix health: winpkg doctor $kind $name" >&2
+    exit "$rc"
+  fi
+  echo "Exited cleanly. Log: $logfile"
 }
 
 cmd_set_runner() {
@@ -602,6 +793,10 @@ cmd_upgrade_prefix() {
     WINEPREFIX="$prefix" wineserver -k || true
     WINEPREFIX="$prefix" wineboot -u
   ' bash "$appdir/prefix"
+  if command -v wine >/dev/null; then
+    local new_version; new_version="$(wine --version 2>/dev/null || echo unknown)"
+    json_set_string "$appdir/config.json" "wine_version" "$new_version"
+  fi
   echo "Prefix upgraded. Rollback if needed: winpkg restore $kind $name $autolabel"
 }
 
@@ -751,20 +946,23 @@ cmd_status() {
 }
 
 # --- build: the one command you actually need after `winpkg init`.
-#     winpkg build app|game NAME INSTALLER [DEP...] [--name "Display"] [--icon PATH]
+#     winpkg build app|game NAME INSTALLER [DEP...] [--exe PATH] [--name "Display"]
+#                  [--icon PATH] [-- INSTALLER_ARGS...]
 #     - creates the prefix if it doesn't exist yet (safe to re-run: reuses it)
-#     - installs any trailing dep verbs first
-#     - runs the installer (auto-snapshotted, so it's undoable)
-#     - scans for the exe and wires up a menu entry automatically, unless
-#       ambiguous, in which case it asks once
+#     - installs any trailing dep verbs first (only ones not already in the template)
+#     - runs the installer (auto-snapshotted first, so it's undoable)
+#     - wires up the exe + menu entry: uses --exe directly if given, otherwise
+#       scans and only asks if it's genuinely ambiguous
 cmd_build() {
   local kind="$1" name="$2" installer="$3"; valid_name "$name"; shift 3
 
-  local display="" icon="" deps=()
+  local display="" icon="" exe="" deps=() installer_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) display="$2"; shift 2 ;;
       --icon) icon="$2"; shift 2 ;;
+      --exe)  exe="$2"; shift 2 ;;
+      --) shift; installer_args=("$@"); break ;;
       *) deps+=("$1"); shift ;;
     esac
   done
@@ -785,20 +983,28 @@ cmd_build() {
     cmd_deps "$kind" "$name" "${deps[@]}"
   fi
 
-  cmd_install "$kind" "$name" "$installer"
+  local rc=0
+  cmd_install "$kind" "$name" "$installer" "${installer_args[@]}" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "" >&2
+    echo "Installer failed (exit code $rc)." >&2
+    echo "Log: $LOGS/ (most recent ${kind}-${name}-install-*.log)" >&2
+    echo "Prefix was auto-snapshotted before this ran, so it's untouched if you want to retry:" >&2
+    echo "  winpkg snapshots $kind $name" >&2
+    exit "$rc"
+  fi
 
-  if [ -n "$display" ] || [ -n "$icon" ]; then
-    # user gave menu details but not necessarily --exe: scan first, then
-    # relabel with the requested display/icon.
-    cmd_scan "$kind" "$name"
-    local exe; exe="$(json_get "$appdir/config.json" exe)"
-    local menu_args=(--exe "$exe")
-    [ -n "$display" ] && menu_args+=(--name "$display")
-    [ -n "$icon" ] && menu_args+=(--icon "$icon")
-    cmd_menu "$kind" "$name" "${menu_args[@]}"
+  local menu_args=()
+  if [ -n "$exe" ]; then
+    menu_args=(--exe "$exe")
   else
     cmd_scan "$kind" "$name"
+    exe="$(json_get "$appdir/config.json" exe)"
+    menu_args=(--exe "$exe")
   fi
+  [ -n "$display" ] && menu_args+=(--name "$display")
+  [ -n "$icon" ] && menu_args+=(--icon "$icon")
+  cmd_menu "$kind" "$name" "${menu_args[@]}"
 
   echo ""
   echo "Done. '$name' is ready:"
@@ -907,9 +1113,21 @@ winpkg $MANAGER_VERSION - Wine app/game manager (Arch/CachyOS)
 
 THE TWO COMMANDS YOU ACTUALLY NEED:
 
-  winpkg init                                             (once, ever)
+  winpkg init                                             (once, ever - see note below)
   winpkg build app|game NAME INSTALLER [DEP...]            build + wire up, one shot
   winpkg status                                            pacman-style overview
+
+winpkg init bakes a baseline runtime (VC++ 2005-2022, .NET 3.5/4.8, .NET
+Desktop 6/7/8, fonts) into the SHARED template. This is the only slow,
+network-heavy step - every app/game created afterward gets it instantly via
+Btrfs reflink, no re-downloading per app. Expect init to take a while the
+first time; everything after it is fast.
+  winpkg init --minimal        skip the baseline, template gets fonts only
+  winpkg template-info         show what's baked into the template
+  winpkg add-fonts DIR [--target app|game NAME]
+                                install real font files (e.g. extracted from a
+                                Windows 11 install) into the template, or into
+                                one specific existing app/game
 
 Example:
   winpkg init
@@ -945,6 +1163,8 @@ main() {
   local cmd="$1"; shift
   case "$cmd" in
     init)            cmd_init "$@" ;;
+    template-info)   cmd_template_info "$@" ;;
+    add-fonts)       cmd_add_fonts "$@" ;;
     build)           cmd_build "$@" ;;
     status)          cmd_status "$@" ;;
     create)          cmd_create "$@" ;;
